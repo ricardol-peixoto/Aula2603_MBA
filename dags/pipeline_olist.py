@@ -31,7 +31,8 @@ default_args = {
 }
 
 
-def download_csvs(**kwargs):
+def _download_files():
+    """Baixa CSVs do GitHub para /tmp local do pod."""
     import requests as req
     os.makedirs(TEMP_DIR, exist_ok=True)
     for f in OLIST_FILES:
@@ -46,16 +47,13 @@ def download_csvs(**kwargs):
     print(f"Todos os {len(OLIST_FILES)} arquivos baixados")
 
 
-def load_to_snowflake(**kwargs):
+def _get_snowflake_conn():
+    """Retorna conexao Snowflake a partir da Connection do Airflow."""
     from snowflake.connector import connect
-    from snowflake.connector.pandas_tools import write_pandas
-    import pandas as pd
     from airflow.hooks.base import BaseHook
-
     conn_info = BaseHook.get_connection("snowflake_default")
     extra = conn_info.extra_dejson if conn_info.extra_dejson else {}
-
-    sf = connect(
+    return connect(
         user=conn_info.login,
         password=conn_info.password,
         account=extra.get("account", ""),
@@ -64,12 +62,25 @@ def load_to_snowflake(**kwargs):
         schema="PUBLIC",
         role=extra.get("role", "ACCOUNTADMIN"),
     )
+
+
+def download_and_load(**kwargs):
+    """Baixa CSVs do GitHub e carrega no Snowflake Bronze (mesmo pod)."""
+    from snowflake.connector.pandas_tools import write_pandas
+    import pandas as pd
+
+    # Passo 1: Download
+    _download_files()
+
+    # Passo 2: Conectar no Snowflake e criar infra
+    sf = _get_snowflake_conn()
     cur = sf.cursor()
     cur.execute("CREATE DATABASE IF NOT EXISTS OLIST_LAB")
     cur.execute("USE DATABASE OLIST_LAB")
     cur.execute("USE SCHEMA PUBLIC")
     cur.execute("USE WAREHOUSE COMPUTE_WH")
 
+    # Passo 3: Carregar cada CSV
     mapping = {
         "olist_orders_dataset.csv": "BRONZE_ORDERS",
         "olist_order_items_dataset.csv": "BRONZE_ORDER_ITEMS",
@@ -87,24 +98,14 @@ def load_to_snowflake(**kwargs):
         cur.execute(f"DROP TABLE IF EXISTS {tbl}")
         _, _, rows, _ = write_pandas(sf, df, tbl, auto_create_table=True)
         print(f"  OK: {rows:,} linhas em {tbl}")
+
     cur.close()
     sf.close()
     print("Bronze completa!")
 
 
 def transform_silver(**kwargs):
-    from snowflake.connector import connect
-    from airflow.hooks.base import BaseHook
-
-    conn_info = BaseHook.get_connection("snowflake_default")
-    extra = conn_info.extra_dejson if conn_info.extra_dejson else {}
-    sf = connect(
-        user=conn_info.login, password=conn_info.password,
-        account=extra.get("account", ""),
-        warehouse=extra.get("warehouse", "COMPUTE_WH"),
-        database="OLIST_LAB", schema="PUBLIC",
-        role=extra.get("role", "ACCOUNTADMIN"),
-    )
+    sf = _get_snowflake_conn()
     cur = sf.cursor()
     cur.execute("USE DATABASE OLIST_LAB")
     cur.execute("USE WAREHOUSE COMPUTE_WH")
@@ -146,18 +147,7 @@ def transform_silver(**kwargs):
 
 
 def build_gold(**kwargs):
-    from snowflake.connector import connect
-    from airflow.hooks.base import BaseHook
-
-    conn_info = BaseHook.get_connection("snowflake_default")
-    extra = conn_info.extra_dejson if conn_info.extra_dejson else {}
-    sf = connect(
-        user=conn_info.login, password=conn_info.password,
-        account=extra.get("account", ""),
-        warehouse=extra.get("warehouse", "COMPUTE_WH"),
-        database="OLIST_LAB", schema="PUBLIC",
-        role=extra.get("role", "ACCOUNTADMIN"),
-    )
+    sf = _get_snowflake_conn()
     cur = sf.cursor()
     cur.execute("USE DATABASE OLIST_LAB")
     cur.execute("USE WAREHOUSE COMPUTE_WH")
@@ -194,18 +184,7 @@ def build_gold(**kwargs):
 
 
 def quality_checks(**kwargs):
-    from snowflake.connector import connect
-    from airflow.hooks.base import BaseHook
-
-    conn_info = BaseHook.get_connection("snowflake_default")
-    extra = conn_info.extra_dejson if conn_info.extra_dejson else {}
-    sf = connect(
-        user=conn_info.login, password=conn_info.password,
-        account=extra.get("account", ""),
-        warehouse=extra.get("warehouse", "COMPUTE_WH"),
-        database="OLIST_LAB", schema="PUBLIC",
-        role=extra.get("role", "ACCOUNTADMIN"),
-    )
+    sf = _get_snowflake_conn()
     cur = sf.cursor()
     checks = []
 
@@ -254,12 +233,11 @@ with DAG(
 
     inicio = EmptyOperator(task_id="inicio")
 
-    t1 = PythonOperator(task_id="download_csvs_github", python_callable=download_csvs)
-    t2 = PythonOperator(task_id="load_bronze_snowflake", python_callable=load_to_snowflake)
-    t3 = PythonOperator(task_id="transform_silver", python_callable=transform_silver)
-    t4 = PythonOperator(task_id="build_gold", python_callable=build_gold)
-    t5 = PythonOperator(task_id="quality_checks", python_callable=quality_checks)
+    t1 = PythonOperator(task_id="download_and_load_bronze", python_callable=download_and_load)
+    t2 = PythonOperator(task_id="transform_silver", python_callable=transform_silver)
+    t3 = PythonOperator(task_id="build_gold", python_callable=build_gold)
+    t4 = PythonOperator(task_id="quality_checks", python_callable=quality_checks)
 
     fim = EmptyOperator(task_id="fim")
 
-    inicio >> t1 >> t2 >> t3 >> t4 >> t5 >> fim
+    inicio >> t1 >> t2 >> t3 >> t4 >> fim
